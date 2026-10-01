@@ -15,6 +15,7 @@ import argparse
 import asyncio
 import datetime
 import time
+from collections import Counter
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
@@ -96,6 +97,8 @@ class Row:
     latency_s: float = 0.0
     ttft_s: Optional[float] = None
     usage: Usage = field(default_factory=Usage)
+    gold: str = ""  # эталонная категория
+    predicted: Optional[str] = None  # что ответила модель; None, если не разобрали
 
 
 def prompt(cand: Candidate, row: Dict[str, Any]) -> List[Dict[str, str]]:
@@ -140,14 +143,19 @@ async def run_candidate(
                     prompt(cand, row), max_tokens=cand.max_tokens
                 )
             except LLMError:
-                return Row(row["id"], ok=False, failed=True)
+                return Row(
+                    row["id"], ok=False, failed=True, gold=row["gold"]["category"]
+                )
+        said = parse_category(res.text)
         return Row(
             row["id"],
-            parse_category(res.text) == row["gold"]["category"],
+            said == row["gold"]["category"],
             truncated=res.truncated,
             latency_s=res.total_s,
             ttft_s=res.ttft_s,
             usage=res.usage,
+            gold=row["gold"]["category"],
+            predicted=said,
         )
 
     return list(await asyncio.gather(*(one(r) for r in rows)))
@@ -183,6 +191,34 @@ def summarize(
     }
 
 
+def errors_report(name: str, rows: List[Row], texts: Dict[str, str]) -> str:
+    """Разбор ошибок кандидата: что с чем перепутано и какие пары чаще
+
+    Сначала поимённо каждое ошибочное обращение с эталонной и предсказанной
+    категорией, потом счёт по парам «эталон -> ответ модели»
+    """
+    bad = [r for r in rows if not r.ok]
+    if not bad:
+        return "### %s\n\nОшибок нет.\n" % name
+    lines = [
+        "### %s: ошибок %d из %d\n" % (name, len(bad), len(rows)),
+        "| обращение | эталон | модель | текст |",
+        "|---|---|---|---|",
+    ]
+    for r in sorted(bad, key=lambda r: r.id):
+        said = "(сбой вызова)" if r.failed else (r.predicted or "(не распознано)")
+        lines.append("| %s | %s | %s | %s |" % (r.id, r.gold, said, texts[r.id][:70]))
+    pairs = Counter(
+        (r.gold, r.predicted) for r in bad if not r.failed and r.predicted
+    )
+    if pairs:
+        lines += ["", "| путаница | раз |", "|---|---|"]
+        lines += [
+            "| %s → %s | %d |" % (gold, said, k) for (gold, said), k in pairs.most_common()
+        ]
+    return "\n".join(lines) + "\n"
+
+
 def table(rows: List[Dict[str, Any]]) -> str:
     """Таблица в формате Markdown"""
     heads = list(rows[0])
@@ -213,10 +249,12 @@ def main() -> None:
             await run_candidate(llm, cand, rows, args.concurrency) for cand in chosen
         ]
 
-    results, spent = [], 0.0
+    texts = {r["id"]: r["text"] for r in rows}
+    results, spent, mistakes = [], 0.0, []
     for cand, done in zip(chosen, asyncio.run(run_all())):
         spent += sum(r.usage.weighted for r in done)
         results.append(summarize(cand.name, done, args.flow))
+        mistakes.append(errors_report(cand.name, done, texts))
     report = table(results)
     print(report)
     footer = (
@@ -230,6 +268,9 @@ def main() -> None:
     (RUNS / "s1_bench.md").write_text(
         "# Замер кандидатов, %s\n\n%s\n%s\n" % (stamp, report, footer), encoding="utf-8"
     )
+    errors = "# Разбор ошибок, %s\n\n%s" % (stamp, "\n".join(mistakes))
+    print("\n" + errors)
+    (RUNS / "s1_errors.md").write_text(errors, encoding="utf-8")
 
 
 if __name__ == "__main__":
